@@ -7,6 +7,7 @@ using System.Data;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Nethermind.Logging;
 using Nethermind.Serialization.Json;
@@ -24,7 +25,7 @@ namespace Nethermind.JsonRpc.Client
         { }
         public BasicJsonRpcClient(Uri uri, IJsonSerializer jsonSerializer, ILogManager logManager, TimeSpan timeout)
         {
-            _logger = logManager?.GetClassLogger() ?? throw new ArgumentNullException(nameof(logManager));
+            _logger = logManager?.GetClassLogger<BasicJsonRpcClient>() ?? throw new ArgumentNullException(nameof(logManager));
             _jsonSerializer = jsonSerializer;
 
             _client = new HttpClient { BaseAddress = uri };
@@ -37,9 +38,9 @@ namespace Nethermind.JsonRpc.Client
         public async Task<string?> Post(string method, params object?[] parameters)
         {
             string request = GetJsonRequest(method, parameters);
-            HttpResponseMessage response = await _client.PostAsync("", new StringContent(request, Encoding.UTF8, "application/json"));
-            string content = await response.Content.ReadAsStringAsync();
-            return content;
+            using StringContent requestContent = new(request, Encoding.UTF8, "application/json");
+            using HttpResponseMessage response = await _client.PostAsync("", requestContent);
+            return await response.Content.ReadAsStringAsync();
         }
 
         public async Task<T?> Post<T>(string method, params object?[] parameters)
@@ -48,11 +49,13 @@ namespace Nethermind.JsonRpc.Client
             try
             {
                 string request = GetJsonRequest(method, parameters);
-                HttpResponseMessage response = await _client.PostAsync("", new StringContent(request, Encoding.UTF8, "application/json"));
+                using StringContent requestContent = new(request, Encoding.UTF8, "application/json");
+                using HttpResponseMessage response = await _client.PostAsync("", requestContent);
                 responseString = await response.Content.ReadAsStringAsync();
                 if (_logger.IsTrace) _logger.Trace(responseString);
 
-                JsonRpcResponse<T> jsonResponse = _jsonSerializer.Deserialize<JsonRpcResponse<T>>(responseString);
+                JsonRpcResponse<T> jsonResponse = _jsonSerializer.Deserialize<JsonRpcResponse<T>>(responseString)
+                    ?? throw new JsonException("JSON-RPC response decoded as null.");
                 if (jsonResponse.Error is not null)
                 {
                     if (_logger.IsError) _logger.Error(string.Concat(jsonResponse.Error.Message, " | ", jsonResponse.Error.Data));
@@ -87,24 +90,21 @@ namespace Nethermind.JsonRpc.Client
 
         private void AddAuthorizationHeader()
         {
-            var url = _client.BaseAddress.ToString();
+            string url = _client.BaseAddress.ToString();
             if (!url.Contains('@'))
             {
                 return;
             }
 
-            var urlData = url.Split("://");
-            var data = urlData[1].Split("@")[0];
-            var encodedData = Base64Encode(data);
+            string[] urlData = url.Split("://");
+            string data = urlData[1].Split("@")[0];
+            string encodedData = Base64Encode(data);
             _client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Basic", encodedData);
         }
 
         private static string Base64Encode(string plainText)
             => Convert.ToBase64String(Encoding.UTF8.GetBytes(plainText));
 
-        public virtual void Dispose()
-        {
-            _client.Dispose();
-        }
+        public virtual void Dispose() => _client.Dispose();
     }
 }

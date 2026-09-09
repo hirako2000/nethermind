@@ -9,7 +9,6 @@ using Nethermind.Core.Crypto;
 using Nethermind.Core.Extensions;
 using Nethermind.Core.Specs;
 using Nethermind.Core.Test;
-using Nethermind.Db;
 using Nethermind.Evm.CodeAnalysis;
 using Nethermind.Specs;
 using Nethermind.Evm.GasPolicy;
@@ -18,8 +17,6 @@ using Nethermind.Evm.Tracing;
 using Nethermind.Int256;
 using Nethermind.Logging;
 using Nethermind.Specs.Forks;
-using Nethermind.State;
-using Nethermind.Trie.Pruning;
 using Nethermind.Blockchain;
 
 namespace Nethermind.Evm.Benchmark
@@ -31,10 +28,11 @@ namespace Nethermind.Evm.Benchmark
         private ITxTracer _txTracer = NullTxTracer.Instance;
         private ExecutionEnvironment _environment;
         private IVirtualMachine _virtualMachine;
-        private BlockHeader _header = new BlockHeader(Keccak.Zero, Keccak.Zero, Address.Zero, UInt256.One, MainnetSpecProvider.MuirGlacierBlockNumber, Int64.MaxValue, 1UL, Bytes.Empty);
+        private BlockHeader _header = new(Keccak.Zero, Keccak.Zero, Address.Zero, UInt256.One, MainnetSpecProvider.MuirGlacierBlockNumber, Int64.MaxValue, 1UL, Bytes.Empty);
         private IBlockhashProvider _blockhashProvider = new TestBlockhashProvider();
         private VmState<EthereumGasPolicy> _evmState;
         private IWorldState _stateProvider;
+        private IDisposable _stateScope;
 
         public IEnumerable<byte[]> Bytecodes
         {
@@ -84,7 +82,8 @@ namespace Nethermind.Evm.Benchmark
         public void GlobalSetup()
         {
             _stateProvider = TestWorldStateFactory.CreateForTest();
-            _stateProvider.CreateAccount(Address.Zero, 1000.Ether());
+            _stateScope = _stateProvider.BeginScope(IWorldState.PreGenesis);
+            _stateProvider.CreateAccount(Address.Zero, 1000.Ether);
             _stateProvider.Commit(_spec);
 
             Console.WriteLine(MuirGlacier.Instance);
@@ -99,11 +98,10 @@ namespace Nethermind.Evm.Benchmark
                 codeInfo: new CodeInfo(Bytecode),
                 callDepth: 0,
                 value: 0,
-                transferValue: 0,
                 inputData: default
             );
 
-            _evmState = VmState<EthereumGasPolicy>.RentTopLevel(EthereumGasPolicy.FromLong(100_000_000L), ExecutionType.TRANSACTION, _environment, new StackAccessTracker(), _stateProvider.TakeSnapshot());
+            _evmState = VmState<EthereumGasPolicy>.RentTopLevel(EthereumGasPolicy.FromULong(100_000_000UL), ExecutionType.TRANSACTION, _environment, new StackAccessTracker(), _stateProvider.TakeSnapshot());
         }
 
         [GlobalCleanup]
@@ -111,6 +109,7 @@ namespace Nethermind.Evm.Benchmark
         {
             _evmState.Dispose();
             _environment.Dispose();
+            _stateScope.Dispose();
         }
 
         [Benchmark(Baseline = true)]
@@ -128,9 +127,6 @@ namespace Nethermind.Evm.Benchmark
         }
 
         [Benchmark]
-        public void No_machine_running()
-        {
-            _stateProvider.Reset();
-        }
+        public void No_machine_running() => _stateProvider.Reset();
     }
 }

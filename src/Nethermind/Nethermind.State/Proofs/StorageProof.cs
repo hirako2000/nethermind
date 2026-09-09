@@ -4,7 +4,6 @@
 using Nethermind.Serialization.Json;
 using System;
 using System.Text.Json.Serialization;
-using Nethermind.Core.Crypto;
 
 namespace Nethermind.State.Proofs;
 
@@ -14,7 +13,7 @@ namespace Nethermind.State.Proofs;
 public class StorageProof
 {
     public string? Key { get; set; }
-    public byte[][]? Proof { get; set; }
+    public byte[][] Proof { get; set; } = [];
 
     [JsonConverter(typeof(ProofStorageValueConverter))]
     public ReadOnlyMemory<byte>? Value { get; set; }

@@ -1,127 +1,212 @@
 // SPDX-FileCopyrightText: 2025 Demerzel Solutions Limited
 // SPDX-License-Identifier: LGPL-3.0-only
 
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading.Tasks;
-using FluentAssertions;
+using System;
 using Nethermind.Blockchain;
 using Nethermind.Consensus.Rewards;
 using Nethermind.Core;
 using Nethermind.Core.Crypto;
 using Nethermind.Core.Specs;
+using Nethermind.Core.Test;
 using Nethermind.Core.Test.Builders;
+using Nethermind.Core.Test.Db;
 using Nethermind.Crypto;
+using Nethermind.Evm.State;
+using Nethermind.Evm.TransactionProcessing;
+using Nethermind.Evm;
 using Nethermind.Int256;
+using Nethermind.Logging;
 using Nethermind.Xdc.Contracts;
 using Nethermind.Xdc.Spec;
 using Nethermind.Xdc.Test.Helpers;
 using Nethermind.Xdc.Types;
 using NSubstitute;
+using NSubstitute.ExceptionExtensions;
 using NUnit.Framework;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 
 namespace Nethermind.Xdc.Test.ModuleTests;
 
+[NonParallelizable]
 public class RewardTests
 {
+    [TestCase(false, 3)]
+    [TestCase(true, 0)]
+    public void GetRewardMasternodes_GenesisHeader_UsesExpectedValidatorSource(bool isSubnet, int expectedCount)
+    {
+        Address[] extraDataMasternodes =
+        [
+            Address.FromNumber(1),
+            Address.FromNumber(2),
+            Address.FromNumber(3),
+        ];
+        XdcBlockHeaderBuilder builder = isSubnet
+            ? Build.A.XdcSubnetBlockHeader()
+            : Build.A.XdcBlockHeader();
+        builder.WithNumber(0);
+        builder.WithValidators(Array.Empty<Address>());
+        builder.WithExtraData(XdcTestHelper.BuildV1ExtraData(extraDataMasternodes));
+        XdcBlockHeader checkpointHeader = builder.TestObject;
+        IXdcReleaseSpec spec = Substitute.For<IXdcReleaseSpec>();
+        spec.SwitchBlock.Returns(0UL);
+        XdcRewardCalculatorSource source = CreateRewardCalculatorSource(isSubnet);
+        XdcRewardCalculator rewardCalculator = (XdcRewardCalculator)source.Get(
+            CreateXdcTransactionProcessor(Substitute.For<ISpecProvider>(), Substitute.For<IMasternodeVotingContract>()));
+
+        HashSet<Address> masternodes = rewardCalculator.GetRewardMasternodes(checkpointHeader, spec);
+
+        Assert.That(rewardCalculator, isSubnet ? Is.TypeOf<XdcSubnetRewardCalculator>() : Is.TypeOf<XdcRewardCalculator>());
+        Assert.That(masternodes, Has.Count.EqualTo(expectedCount));
+        if (!isSubnet)
+        {
+            Assert.That(masternodes, Is.EquivalentTo(extraDataMasternodes));
+        }
+    }
+
     // Test ported from XDC reward_test :
     // https://github.com/XinFinOrg/XDPoSChain/blob/af4178b2c7f9d668d8ba1f3a0244606a20ce303d/consensus/tests/engine_v2_tests/reward_test.go#L18
     [Test]
     public async Task TestHookRewardV2()
     {
-        var chain = await XdcTestBlockchain.Create();
-        var masternodeVotingContract = Substitute.For<IMasternodeVotingContract>();
-        var rc = new XdcRewardCalculator(
+        using XdcTestBlockchain chain = await XdcTestBlockchain.Create();
+        IMasternodeVotingContract masternodeVotingContract = Substitute.For<IMasternodeVotingContract>();
+        SigningTxCache signingTxCache = new(chain.BlockTree, chain.SpecProvider);
+        chain.ChangeReleaseSpec(spec =>
+        {
+            spec.EpochLength = 50;
+            spec.MergeSignRange = 5;
+            spec.MergeSignRange = Math.Min(spec.MergeSignRange, spec.EpochLength / 2);
+            if (spec.MergeSignRange < 1) spec.MergeSignRange = 1;
+        });
+
+        masternodeVotingContract
+            .GetCandidateOwner(Arg.Any<IWorldState>(), Arg.Any<Address>())
+            .Returns(ci => ci.ArgAt<Address>(1));
+
+        XdcRewardCalculator rewardCalculator = new(
             chain.EpochSwitchManager,
             chain.SpecProvider,
             chain.BlockTree,
-            masternodeVotingContract
+            masternodeVotingContract,
+            Substitute.For<IMintedRecordContract>(),
+            signingTxCache,
+            CreateXdcTransactionProcessor(chain.SpecProvider, masternodeVotingContract, chain.MainWorldState)
         );
-        var head = (XdcBlockHeader)chain.BlockTree.Head!.Header;
-        IXdcReleaseSpec spec = chain.SpecProvider.GetXdcSpec(head, chain.XdcContext.CurrentRound);
-        var epochLength = spec.EpochLength;
 
-        // Add blocks up to epochLength (E) + 15 and create a signing tx that will be inserted in the next block
-        await chain.AddBlocks(epochLength + 15 - 3);
-        var header915 = chain.BlockTree.Head!.Header as XdcBlockHeader;
-        Assert.That(header915, Is.Not.Null);
-        PrivateKey signer915 = GetSignerFromMasternodes(chain, header915, spec);
-        Address owner = signer915.Address;
-        masternodeVotingContract.GetCandidateOwner(Arg.Any<BlockHeader>(), signer915.Address).Returns(owner);
+        XdcBlockHeader head = (XdcBlockHeader)chain.BlockTree.Head!.Header;
+        IXdcReleaseSpec spec = chain.SpecProvider.GetXdcSpec(head, chain.XdcContext.CurrentRound);
+
+        ulong epochLength = spec.EpochLength;
+        ulong mergeSignRange = spec.MergeSignRange;
+
+        ulong initialHeadNumber = chain.BlockTree.Head!.Number;
+
+        // --- Part 1: create signing tx for header (E + mergeSignRange) included in next block ---
+
+        ulong targetSignedHeaderNumberEPlusMerge = epochLength + mergeSignRange;
+        await chain.AddBlocks(targetSignedHeaderNumberEPlusMerge - initialHeadNumber);
+
+        XdcBlockHeader? signedHeaderEPlusMerge = chain.BlockTree.Head!.Header as XdcBlockHeader;
+        Assert.That(signedHeaderEPlusMerge, Is.Not.Null);
+
+        // Note: SubmitTransactionSign signs with DI `ISigner`, not necessarily `chain.Signer`
         await chain.AddBlock(BuildSigningTx(
             spec,
-            header915.Number,
-            header915.Hash ?? header915.CalculateHash().ToHash256(),
-            signer915));
+            signedHeaderEPlusMerge.Number,
+            signedHeaderEPlusMerge.Hash ?? signedHeaderEPlusMerge.CalculateHash().ToHash256(),
+            chain.Signer.Key!,
+            chain.ReadOnlyState.GetNonce(chain.Signer.Address)));
 
-        // Add blocks up until 3E and evaluate rewards at this checkpoint
-        // Save block 3E - 15 for second part of the test
-        await chain.AddBlocks(2 * epochLength - 31);
-        var header2685 = chain.BlockTree.Head!.Header as XdcBlockHeader;
-        Assert.That(header2685, Is.Not.Null);
-        PrivateKey signer2685 = GetSignerFromMasternodes(chain, header2685, spec);
-        Address owner2 = signer2685.Address;
-        masternodeVotingContract.GetCandidateOwner(Arg.Any<BlockHeader>(), signer2685.Address).Returns(owner2);
-        // Continue adding blocks up until 3E
-        await chain.AddBlocks(15);
-        Block block2700 = chain.BlockTree.Head!;
-        var header2700 = block2700.Header as XdcBlockHeader;
-        Assert.That(header2700, Is.Not.Null);
+        // --- Move to header (3E - mergeSignRange) to sign it later in Part 2 ---
 
-        BlockReward[] rewardsAt2700 = rc.CalculateRewards(block2700);
+        ulong blockNumberAfterIncludingSignTx = chain.BlockTree.Head!.Number;
+        ulong targetSignedHeader3EMinusMerge = 3 * epochLength - mergeSignRange;
+        await chain.AddBlocks(targetSignedHeader3EMinusMerge - blockNumberAfterIncludingSignTx);
 
-        // Expect exactly 2 entries: one for the masternode owner and one for foundation
+        XdcBlockHeader? signedHeader3EMinusMerge = chain.BlockTree.Head!.Header as XdcBlockHeader;
+        Assert.That(signedHeader3EMinusMerge, Is.Not.Null);
+
+        // --- Evaluate rewards at checkpoint (3E) ---
+
+        ulong headBeforeCheckpoint = chain.BlockTree.Head!.Number;
+        ulong checkpoint3E = 3 * epochLength;
+        await chain.AddBlocks(checkpoint3E - headBeforeCheckpoint);
+
+        Block block3E = chain.BlockTree.Head!;
+        XdcBlockHeader? header3E = block3E.Header as XdcBlockHeader;
+        Assert.That(header3E, Is.Not.Null);
+
+        BlockReward[] rewardsAt3E = rewardCalculator.CalculateRewards(block3E);
+
         Address foundation = spec.FoundationWallet;
-        foundation.Should().NotBe(Address.Zero);
+        Assert.That(foundation, Is.Not.Null);
 
-        Assert.That(rewardsAt2700, Has.Length.EqualTo(2));
-        rewardsAt2700.Length.Should().Be(2);
+        Assert.That(rewardsAt3E, Has.Length.EqualTo(2));
 
-        UInt256 total = rewardsAt2700.Aggregate(UInt256.Zero, (acc, r) => acc + r.Value);
-        UInt256 ownerReward = rewardsAt2700.Single(r => r.Address == owner).Value;
-        UInt256 foundationReward = rewardsAt2700.Single(r => r.Address == foundation).Value;
+        UInt256 totalAt3E = rewardsAt3E.Aggregate(UInt256.Zero, (acc, r) => acc + r.Value);
+        UInt256 foundationRewardAt3E = rewardsAt3E.Single(r => r.Address == foundation).Value;
+        UInt256 ownerRewardAt3E = rewardsAt3E.Single(r => r.Address != foundation).Value;
 
-        // Check 90/10 split
-        Assert.That(foundationReward, Is.EqualTo(total / 10));
-        Assert.That(ownerReward, Is.EqualTo(total * 90 / 100));
+        // Check 90/10 split on totals
+        Assert.That(foundationRewardAt3E, Is.EqualTo(totalAt3E / 10));
+        Assert.That(ownerRewardAt3E, Is.EqualTo(totalAt3E * 90 / 100));
 
-        // === Second part of the test: signing hash in a different epoch still counts ===
+        // === Part 2: signing hash in a different epoch still counts ===
 
-        Transaction signingTx2 = BuildSigningTx(
+        // Place signing tx for the previously captured (3E - mergeSignRange) header in block (3E + mergeSignRange + 1)
+        ulong targetIncludingBlockForSecondSign = 3 * epochLength + mergeSignRange + 1;
+        ulong current = chain.BlockTree.Head!.Number;
+        await chain.AddBlocks(targetIncludingBlockForSecondSign - current - 1); // move so AddBlockMayHaveExtraTx produces the target
+
+        // For 4E reward calculation, the masternodes come from the second epoch switch found
+        // when walking backwards from 4E. The signed header (3E - mergeSignRange) is in the
+        // range [2E+1, 3E), so its epoch switch info provides the relevant masternodes.
+        // Use a masternode from that epoch to ensure the signature is counted.
+        EpochSwitchInfo? epochSwitchInfoFor2E = chain.EpochSwitchManager.GetEpochSwitchInfo(signedHeader3EMinusMerge);
+        Assert.That(epochSwitchInfoFor2E, Is.Not.Null);
+        PrivateKey signerForPart2 = chain.MasterNodeCandidates.First(k => k.Address == epochSwitchInfoFor2E!.Masternodes[0]);
+
+        // Set the chain's signer to our chosen masternode - required because
+        // SignTransactionFilter rejects signing txs from non-current-signers
+        chain.Signer.SetSigner(signerForPart2);
+
+        await chain.AddBlock(BuildSigningTx(
             spec,
-            header2685.Number,
-            header2685.Hash!,
-            signer2685);
+            signedHeader3EMinusMerge.Number,
+            signedHeader3EMinusMerge.Hash ?? signedHeader3EMinusMerge.CalculateHash().ToHash256(),
+            signerForPart2,
+            chain.ReadOnlyState.GetNonce(signerForPart2.Address)));
 
-        // Place signingTx2 in block 3E + 16 (different epoch than the signed block)
-        await chain.AddBlocks(15);
-        await chain.AddBlock(signingTx2);
+        // --- Evaluate rewards at checkpoint (4E) ---
+        ulong checkpoint4E = 4 * epochLength;
+        current = chain.BlockTree.Head!.Number;
+        await chain.AddBlocks(checkpoint4E - current);
 
-        // Add blocks up until 4E and check rewards
-        await chain.AddBlocks(epochLength - 16);
-        Block block3600 = chain.BlockTree.Head!;
-        var header3600 = block3600.Header as XdcBlockHeader;
-        Assert.That(header3600, Is.Not.Null);
-        BlockReward[] rewardsAt3600 = rc.CalculateRewards(block3600);
+        Block block4E = chain.BlockTree.Head!;
+        XdcBlockHeader? header4E = block4E.Header as XdcBlockHeader;
+        Assert.That(header4E, Is.Not.Null);
 
-        // Same expectations: exactly two outputs with 90/10 split
-        // Since this only counts signing txs from 2E to 3E, only signingTx2 should get counted
-        Assert.That(rewardsAt3600, Has.Length.EqualTo(2));
-        UInt256 total2 = rewardsAt3600.Aggregate(UInt256.Zero, (acc, r) => acc + r.Value);
-        UInt256 ownerReward2 = rewardsAt3600.Single(r => r.Address == owner2).Value;
-        UInt256 foundationReward2 = rewardsAt3600.Single(r => r.Address == foundation).Value;
+        BlockReward[] rewardsAt4E = rewardCalculator.CalculateRewards(block4E);
+        Assert.That(rewardsAt4E, Has.Length.EqualTo(2));
 
-        Assert.That(foundationReward2, Is.EqualTo(total2 / 10));
-        Assert.That(ownerReward2, Is.EqualTo(total2 * 90 / 100));
+        UInt256 totalAt4E = rewardsAt4E.Aggregate(UInt256.Zero, (acc, r) => acc + r.Value);
+        UInt256 foundationRewardAt4E = rewardsAt4E.Single(r => r.Address == foundation).Value;
+        UInt256 ownerRewardAt4E = rewardsAt4E.Single(r => r.Address != foundation).Value;
 
-        // === Third part of the test: if no signing tx, reward should be empty ===
+        Assert.That(foundationRewardAt4E, Is.EqualTo(totalAt4E / 10));
+        Assert.That(ownerRewardAt4E, Is.EqualTo(totalAt4E * 90 / 100));
 
-        // Add blocks up to 5E and check rewards
-        await chain.AddBlocks(epochLength);
-        Block block4500 = chain.BlockTree.Head!;
-        BlockReward[] rewardsAt4500 = rc.CalculateRewards(block4500);
-        // If no valid signing txs were counted for that epoch, expect no rewards.
-        rewardsAt4500.Should().BeEmpty();
+        // === Part 3: if no signing tx, reward should be empty ===
+
+        ulong checkpoint5E = 5 * epochLength;
+        current = chain.BlockTree.Head!.Number;
+        await chain.AddBlocks(checkpoint5E - current);
+
+        Block block5E = chain.BlockTree.Head!;
+        BlockReward[] rewardsAt5E = rewardCalculator.CalculateRewards(block5E);
+        Assert.That(rewardsAt5E, Is.Empty);
     }
 
     // Test ported from XDC reward_test :
@@ -129,86 +214,105 @@ public class RewardTests
     [Test]
     public async Task TestHookRewardV2SplitReward()
     {
-        var chain = await XdcTestBlockchain.Create();
-        var masternodeVotingContract = Substitute.For<IMasternodeVotingContract>();
-        var rc = new XdcRewardCalculator(
+        XdcTestBlockchain chain = await XdcTestBlockchain.Create();
+        IMasternodeVotingContract masternodeVotingContract = Substitute.For<IMasternodeVotingContract>();
+        SigningTxCache signingTxCache = new(chain.BlockTree, chain.SpecProvider);
+        masternodeVotingContract
+            .GetCandidateOwner(Arg.Any<IWorldState>(), Arg.Any<Address>())
+            .Returns(ci => ci.ArgAt<Address>(1));
+
+        XdcRewardCalculator rewardCalculator = new(
             chain.EpochSwitchManager,
             chain.SpecProvider,
             chain.BlockTree,
-            masternodeVotingContract
+            masternodeVotingContract,
+            Substitute.For<IMintedRecordContract>(),
+            signingTxCache,
+            CreateXdcTransactionProcessor(chain.SpecProvider, masternodeVotingContract, chain.MainWorldState)
         );
 
-        var head = (XdcBlockHeader)chain.BlockTree.Head!.Header;
+        XdcBlockHeader head = (XdcBlockHeader)chain.BlockTree.Head!.Header;
         IXdcReleaseSpec spec = chain.SpecProvider.GetXdcSpec(head, chain.XdcContext.CurrentRound);
-        var epochLength = spec.EpochLength;
 
-        // - Insert 1 signing tx for header (E + 15) signed by signerA into block (E + 16)
-        // - Insert 2 signing txs (one for header (E + 15), one for header (2E - 15)) signed by signerB into block (2E - 1)
+        ulong epochLength = spec.EpochLength;
+        ulong mergeSignRange = spec.MergeSignRange;
+
+        // - Insert 1 signing tx for header (E + mergeSignRange) signed by signerA into block (E + mergeSignRange + 1)
+        // - Insert 2 signing txs (one for header (E + mergeSignRange), one for header (2E - mergeSignRange)) signed by signerB into block (2E - 1)
         // - Verify: rewards at (3E) split 1:2 between A:B with 90/10 owner/foundation
 
-        // Move to block (E + 15)
-        await chain.AddBlocks(epochLength + 15 - 3);
-        var header915 = (XdcBlockHeader)chain.BlockTree.Head!.Header;
+        ulong initialHeadNumber = chain.BlockTree.Head!.Number;
+        ulong targetHeaderEPlusMerge = epochLength + mergeSignRange;
+        await chain.AddBlocks(targetHeaderEPlusMerge - initialHeadNumber);
 
-        EpochSwitchInfo? epochInfo = chain.EpochSwitchManager.GetEpochSwitchInfo(header915);
-        Assert.That(epochInfo, Is.Not.Null);
-        PrivateKey[] masternodes = chain.TakeRandomMasterNodes(spec, epochInfo);
-        PrivateKey signerA = masternodes.First();
-        PrivateKey signerB = masternodes.Last();
+        XdcBlockHeader headerEPlusMerge = (XdcBlockHeader)chain.BlockTree.Head!.Header;
+
+        EpochSwitchInfo? epochInfoAtEPlusMerge = chain.EpochSwitchManager.GetEpochSwitchInfo(headerEPlusMerge);
+        Assert.That(epochInfoAtEPlusMerge, Is.Not.Null);
+        _ = chain.TakeRandomMasterNodes(spec, epochInfoAtEPlusMerge);
+
+        PrivateKey signerA = chain.Signer.Key!;
         Address ownerA = signerA.Address;
-        Address ownerB = signerB.Address;
-        masternodeVotingContract.GetCandidateOwner(Arg.Any<BlockHeader>(), signerA.Address).Returns(ownerA);
-        masternodeVotingContract.GetCandidateOwner(Arg.Any<BlockHeader>(), signerB.Address).Returns(ownerB);
 
-        // Insert 1 signing tx for header (E + 15) in block (E + 16)
+        // Insert 1 signing tx for header (E + mergeSignRange) in block (E + mergeSignRange + 1)
         Transaction txA = BuildSigningTx(
             spec,
-            header915.Number,
-            header915.Hash ?? header915.CalculateHash().ToHash256(),
+            headerEPlusMerge.Number,
+            headerEPlusMerge.Hash ?? headerEPlusMerge.CalculateHash().ToHash256(),
             signerA);
-        await chain.AddBlock(txA); // advances to (E + 16)
 
-        // Move to block (2E - 15) to capture that header as well
-        var currentNumber = chain.BlockTree.Head!.Number;
-        await chain.AddBlocks(epochLength - 31);
-        var header1785 = (XdcBlockHeader)chain.BlockTree.Head!.Header;
+        await chain.AddBlock(txA); // advances by 1
 
-        // Prepare two signing txs signed by signerB:
-        // - for header (E + 15)
-        // - for header (2E - 15)
-        Transaction txB1 = BuildSigningTx(
+        ulong targetHeader2EMinusMerge = 2 * epochLength - mergeSignRange;
+        ulong currentHeadNumber = chain.BlockTree.Head!.Number;
+        await chain.AddBlocks(targetHeader2EMinusMerge - currentHeadNumber);
+
+        XdcBlockHeader header2EMinusMerge = (XdcBlockHeader)chain.BlockTree.Head!.Header;
+
+        // Create a block (2E - 1) containing 2 signing txs from signerB.
+        // Move to (2E - 2) so that AddBlock puts us at (2E - 1).
+        ulong targetBlock2EMinus1 = 2 * epochLength - 1;
+        ulong targetBlock2EMinus2 = targetBlock2EMinus1 - 1;
+
+        currentHeadNumber = chain.BlockTree.Head!.Number;
+        await chain.AddBlocks(targetBlock2EMinus2 - currentHeadNumber);
+
+        PrivateKey signerB = chain.Signer.Key!;
+        Address ownerB = signerB.Address;
+
+        Assert.That(ownerA, Is.Not.EqualTo(ownerB));
+
+        Transaction txBForEPlusMerge = BuildSigningTx(
             spec,
-            header915.Number,
-            header915.Hash!,
+            headerEPlusMerge.Number,
+            headerEPlusMerge.Hash!,
             signerB);
 
-        Transaction txB2 = BuildSigningTx(
+        Transaction txBFor2EMinusMerge = BuildSigningTx(
             spec,
-            header1785.Number,
-            header1785.Hash!,
+            header2EMinusMerge.Number,
+            header2EMinusMerge.Hash!,
             signerB,
-            1);
+            nonce: 1);
 
-        // Advance to (2E - 2), then add a block with both signerB txs to be at (2E - 1)
-        await chain.AddBlocks(13);
-        await chain.AddBlock(txB1, txB2); // now at (2E - 1)
+        await chain.AddBlock(txBForEPlusMerge, txBFor2EMinusMerge); // now at (2E - 1)
 
-        // Rewards at (3E) should exist with split 1:2 across A:B and 90/10 owner/foundation
-        await chain.AddBlocks(epochLength + 1); // from (2E - 1) to (3E)
-        Block block2700 = chain.BlockTree.Head!;
-        BlockReward[] rewards = rc.CalculateRewards(block2700);
+        ulong checkpoint3E = 3 * epochLength;
+        currentHeadNumber = chain.BlockTree.Head!.Number;
+        await chain.AddBlocks(checkpoint3E - currentHeadNumber);
+
+        Block block3E = chain.BlockTree.Head!;
+        BlockReward[] rewards = rewardCalculator.CalculateRewards(block3E);
 
         Address foundation = spec.FoundationWallet;
-
-        // Expect exactly 3 entries: ownerA, ownerB, foundation.
         Assert.That(rewards.Length, Is.EqualTo(3));
 
-        // Calculate exact rewards for each address
         UInt256 totalRewards = (UInt256)spec.Reward * Unit.Ether;
+
         UInt256 signerAReward = totalRewards / 3;
         UInt256 ownerAReward = signerAReward * 90 / 100;
         UInt256 foundationReward = signerAReward / 10;
-        UInt256 signerBReward = totalRewards * 2 / 3;
+        UInt256 signerBReward = totalRewards / 3 * 2;
         UInt256 ownerBReward = signerBReward * 90 / 100;
         foundationReward += signerBReward / 10;
 
@@ -225,99 +329,469 @@ public class RewardTests
     [Test]
     public void RewardCalculator_SplitReward_MatchesRounding()
     {
-        const long epoch = 45, reward = 250;
+        const ulong epochLength = 45;
+        const ulong totalRewardInEther = 250;
+
+        const ulong mergeSignRange = 15;
+        const ulong firstSignedBlockNumber = mergeSignRange;
+        const ulong secondSignedBlockNumber = 2 * mergeSignRange;
+        const ulong firstIncludedTxBlockNumber = firstSignedBlockNumber + 1;
+        const ulong secondIncludedTxBlockNumber = secondSignedBlockNumber + 1;
+
         PrivateKey[] masternodes = XdcTestHelper.GeneratePrivateKeys(2);
         PrivateKey signerA = masternodes.First();
         PrivateKey signerB = masternodes.Last();
-        var foundationWalletAddr = new Address("0x0000000000000000000000000000000000000068");
-        var blockSignerContract = new Address("0x0000000000000000000000000000000000000089");
+
+        Address foundationWalletAddr = new("0x0000000000000000000000000000000000000068");
+        Address blockSignerContract = new("0x0000000000000000000000000000000000000089");
 
         IEpochSwitchManager epochSwitchManager = Substitute.For<IEpochSwitchManager>();
         epochSwitchManager.IsEpochSwitchAtBlock(Arg.Any<XdcBlockHeader>())
-            .Returns(ci => ((XdcBlockHeader)ci.Args()[0]!).Number % epoch == 0);
+            .Returns(ci => ((XdcBlockHeader)ci.Args()[0]!).Number % epochLength == 0);
 
         IXdcReleaseSpec xdcSpec = Substitute.For<IXdcReleaseSpec>();
-        xdcSpec.EpochLength.Returns((int)epoch);
+        xdcSpec.EpochLength.Returns(epochLength);
         xdcSpec.FoundationWallet.Returns(foundationWalletAddr);
         xdcSpec.BlockSignerContract.Returns(blockSignerContract);
-        xdcSpec.Reward.Returns(reward);
-        xdcSpec.SwitchBlock.Returns(0);
+        xdcSpec.Reward.Returns(totalRewardInEther);
+        xdcSpec.SwitchBlock.Returns(0UL);
+        xdcSpec.MergeSignRange.Returns(mergeSignRange);
+        xdcSpec.IsTipUpgradeRewardEnabled.Returns(false);
+
         ISpecProvider specProvider = Substitute.For<ISpecProvider>();
         specProvider.GetSpec(Arg.Any<ForkActivation>()).Returns(xdcSpec);
 
         IBlockTree tree = Substitute.For<IBlockTree>();
-        long size = 2 * epoch + 1;
-        var blockHeaders = new XdcBlockHeader[size];
-        var blocks = new Block[size];
-        for (int i = 0; i <= epoch * 2; i++)
+        ulong chainSize = 2 * epochLength + 1;
+
+        XdcBlockHeader[] blockHeaders = new XdcBlockHeader[chainSize];
+        Block[] blocks = new Block[chainSize];
+        Address[] masternodeAddresses = masternodes.Select(m => m.Address).ToArray();
+        for (ulong i = 0; i <= epochLength * 2; i++)
         {
-            blockHeaders[i] = Build.A.XdcBlockHeader()
+            XdcBlockHeaderBuilder builder = Build.A.XdcBlockHeader()
                 .WithNumber(i)
-                .WithValidators(masternodes.Select(m => m.Address).ToArray())
-                .WithExtraConsensusData(new ExtraFieldsV2((ulong)i, Build.A.QuorumCertificate().TestObject))
-                .TestObject;
+                .WithValidators(masternodeAddresses);
+            // Block 0 is the v1 genesis (SwitchBlock=0), so ExtraData must use v1 format
+            if (i == 0)
+                builder.WithExtraData(XdcTestHelper.BuildV1ExtraData(masternodeAddresses));
+            else
+                builder.WithExtraConsensusData(new ExtraFieldsV2((ulong)i, Build.A.QuorumCertificate().TestObject));
+            blockHeaders[i] = builder.TestObject;
             blocks[i] = new Block(blockHeaders[i]);
         }
 
-        // SignerA signs blocks 15 and 30
-        // SignerB signs blocks 15
-        var txsBlock16 = new List<Transaction>();
-        txsBlock16.Add(BuildSigningTx(xdcSpec, 15, blockHeaders[15].Hash!, signerA, 1));
-        txsBlock16.Add(BuildSigningTx(xdcSpec, 15, blockHeaders[15].Hash!, signerB, 2));
-        var txsBlock31 = new List<Transaction>();
-        txsBlock31.Add(BuildSigningTx(xdcSpec, 30, blockHeaders[30].Hash!, signerA, 3));
-        blocks[16] = new Block(blockHeaders[16], new BlockBody(txsBlock16.ToArray(), null, null));
-        blocks[31] = new Block(blockHeaders[31], new BlockBody(txsBlock31.ToArray(), null, null));
-        tree.FindHeader(Arg.Any<Hash256>(), Arg.Any<long>())
-            .Returns(ci => blockHeaders[(long)ci.Args()[1]]);
-        tree.FindBlock(Arg.Any<long>())
-            .Returns(ci => blocks[(long)ci.Args()[0]]);
+        // SignerA signs blocks `mergeSignRange` and `2*mergeSignRange`
+        // SignerB signs block `mergeSignRange`
+        List<Transaction> txsAtFirstIncludedBlock =
+        [
+            BuildSigningTx(xdcSpec, firstSignedBlockNumber, blockHeaders[firstSignedBlockNumber].Hash!, signerA, nonce: 1),
+            BuildSigningTx(xdcSpec, firstSignedBlockNumber, blockHeaders[firstSignedBlockNumber].Hash!, signerB, nonce: 2),
+        ];
+
+        List<Transaction> txsAtSecondIncludedBlock =
+        [
+            BuildSigningTx(xdcSpec, secondSignedBlockNumber, blockHeaders[secondSignedBlockNumber].Hash!, signerA, nonce: 3),
+        ];
+
+        blocks[firstIncludedTxBlockNumber] = new Block(blockHeaders[firstIncludedTxBlockNumber], new BlockBody(txsAtFirstIncludedBlock.ToArray(), null, null));
+        blocks[secondIncludedTxBlockNumber] = new Block(blockHeaders[secondIncludedTxBlockNumber], new BlockBody(txsAtSecondIncludedBlock.ToArray(), null, null));
+
+        tree.FindHeader(Arg.Any<Hash256>(), Arg.Any<ulong?>())
+            .Returns(ci => blockHeaders[(int)ci.ArgAt<ulong?>(1)!]);
+        tree.FindBlock(Arg.Any<Hash256>(), Arg.Any<ulong?>())
+            .Returns(ci => blocks[(int)ci.ArgAt<ulong?>(1)!]);
 
         IMasternodeVotingContract votingContract = Substitute.For<IMasternodeVotingContract>();
-        votingContract.GetCandidateOwner(Arg.Any<BlockHeader>(), Arg.Any<Address>())
-            .Returns(ci => ci.Arg<Address>());
+        votingContract.GetCandidateOwner(Arg.Any<IWorldState>(), Arg.Any<Address>())
+            .Returns(ci => ci.ArgAt<Address>(1));
 
-        var rewardCalculator = new XdcRewardCalculator(epochSwitchManager, specProvider, tree, votingContract);
+        SigningTxCache signingTxCache = new(tree, specProvider);
+        XdcRewardCalculator rewardCalculator = new(epochSwitchManager, specProvider, tree, votingContract, Substitute.For<IMintedRecordContract>(), signingTxCache, CreateXdcTransactionProcessor(specProvider, votingContract));
         BlockReward[] rewards = rewardCalculator.CalculateRewards(blocks.Last());
 
-        // Expect ownerA, ownerB, and foundation
         Assert.That(rewards, Has.Length.EqualTo(3));
 
-        // Expected values from XDC repo:
-        // A gets 2/3 of total, then 90% owner, 10% foundation (flooring at each integer division step)
-        // B gets 1/3 of total, then 90% owner, 10% foundation
-        var aOwnerExpected = UInt256.Parse("149999999999999999999");
-        var aFoundExpected = UInt256.Parse("16666666666666666666");
-        var bOwnerExpected = UInt256.Parse("74999999999999999999");
-        var bFoundExpected = UInt256.Parse("8333333333333333333");
+        UInt256 aOwnerExpected = UInt256.Parse("149999999999999999999");
+        UInt256 aFoundExpected = UInt256.Parse("16666666666666666666");
+        UInt256 bOwnerExpected = UInt256.Parse("74999999999999999999");
+        UInt256 bFoundExpected = UInt256.Parse("8333333333333333333");
 
         UInt256 aOwnerReward = rewards.Single(r => r.Address == signerA.Address).Value;
         UInt256 bOwnerReward = rewards.Single(r => r.Address == signerB.Address).Value;
         UInt256 foundationReward = rewards.Single(r => r.Address == foundationWalletAddr).Value;
 
-        Assert.That(foundationReward, Is.EqualTo(aFoundExpected + bFoundExpected));
-        Assert.That(aOwnerReward, Is.EqualTo(aOwnerExpected));
-        Assert.That(bOwnerReward, Is.EqualTo(bOwnerExpected));
-
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(foundationReward, Is.EqualTo(aFoundExpected + bFoundExpected));
+            Assert.That(aOwnerReward, Is.EqualTo(aOwnerExpected));
+            Assert.That(bOwnerReward, Is.EqualTo(bOwnerExpected));
+        }
     }
 
-
-    private static Transaction BuildSigningTx(IXdcReleaseSpec spec, long blockNumber, Hash256 blockHash, PrivateKey signer, long nonce = 0)
+    [Test]
+    public void TestHookRewardAfterUpgrade()
     {
+        const ulong epochLength = 900;
+        const ulong mergeSignRange = 15;
+        const ulong checkpointNumber = 2700;
+
+        PrivateKey[] keys = XdcTestHelper.GeneratePrivateKeys(9);
+        PrivateKey[] masternodeKeys = [keys[0], keys[1], keys[2], keys[3], keys[4]];
+        PrivateKey signer1 = masternodeKeys.First();
+        PrivateKey signer2 = masternodeKeys.Last();
+        PrivateKey protector1 = keys[5];
+        PrivateKey protector2 = keys[6];
+        PrivateKey observer1 = keys[7];
+        PrivateKey observer2 = keys[8];
+
+        Address[] masternodes = masternodeKeys.Select(key => key.Address).ToArray();
+
+        Address foundationWalletAddr = Address.FromNumber(0x68);
+        Address blockSignerContract = Address.FromNumber(0x89);
+
+        IEpochSwitchManager epochSwitchManager = Substitute.For<IEpochSwitchManager>();
+        epochSwitchManager.IsEpochSwitchAtBlock(Arg.Any<XdcBlockHeader>())
+            .Returns(ci => ((XdcBlockHeader)ci.Args()[0]!).Number % epochLength == 0);
+
+        IXdcReleaseSpec xdcSpec = Substitute.For<IXdcReleaseSpec>();
+        xdcSpec.EpochLength.Returns(epochLength);
+        xdcSpec.FoundationWallet.Returns(foundationWalletAddr);
+        xdcSpec.BlockSignerContract.Returns(blockSignerContract);
+        xdcSpec.SwitchBlock.Returns(0UL);
+        xdcSpec.MergeSignRange.Returns(mergeSignRange);
+        xdcSpec.IsTipUpgradeRewardEnabled.Returns(true);
+        xdcSpec.MaxProtectorNodes.Returns(2);
+        xdcSpec.MaxObserverNodes.Returns(2);
+        xdcSpec.MasternodeReward.Returns((UInt256)500);
+        xdcSpec.ProtectorReward.Returns((UInt256)400);
+        xdcSpec.ObserverReward.Returns((UInt256)300);
+
+        ISpecProvider specProvider = Substitute.For<ISpecProvider>();
+        specProvider.GetSpec(Arg.Any<ForkActivation>()).Returns(xdcSpec);
+
+        IBlockTree tree = Substitute.For<IBlockTree>();
+        ulong chainSize = checkpointNumber + 1;
+        XdcBlockHeader[] blockHeaders = new XdcBlockHeader[chainSize];
+        Block[] blocks = new Block[chainSize];
+
+        for (ulong i = 0; i < chainSize; i++)
+        {
+            XdcBlockHeaderBuilder builder = Build.A.XdcBlockHeader()
+                .WithNumber(i)
+                .WithValidators(masternodes);
+            if (i == 0)
+            {
+                builder.WithExtraData(XdcTestHelper.BuildV1ExtraData(masternodes));
+            }
+            else
+            {
+                builder.WithExtraConsensusData(new ExtraFieldsV2((ulong)i, Build.A.QuorumCertificate().TestObject));
+            }
+
+            if (i == epochLength)
+            {
+                builder.WithPenalties([observer2.Address]);
+            }
+
+            blockHeaders[i] = builder.TestObject;
+            blocks[i] = new Block(blockHeaders[i]);
+        }
+
+        Transaction[] txsAt916 =
+        [
+            BuildSigningTx(xdcSpec, 915, blockHeaders[915].Hash!, signer1, nonce: 1),
+        ];
+
+        Transaction[] txsAt1799 =
+        [
+            BuildSigningTx(xdcSpec, 915, blockHeaders[915].Hash!, signer2, nonce: 2),
+            BuildSigningTx(xdcSpec, 1785, blockHeaders[1785].Hash!, signer2, nonce: 3),
+            BuildSigningTx(xdcSpec, 1785, blockHeaders[1785].Hash!, protector1, nonce: 4),
+            BuildSigningTx(xdcSpec, 915, blockHeaders[915].Hash!, protector2, nonce: 5),
+            BuildSigningTx(xdcSpec, 1785, blockHeaders[1785].Hash!, protector2, nonce: 6),
+            BuildSigningTx(xdcSpec, 1785, blockHeaders[1785].Hash!, observer1, nonce: 7),
+            BuildSigningTx(xdcSpec, 1785, blockHeaders[1785].Hash!, observer2, nonce: 8),
+        ];
+
+        blocks[916] = new Block(blockHeaders[916], new BlockBody(txsAt916, null, null));
+        blocks[1799] = new Block(blockHeaders[1799], new BlockBody(txsAt1799, null, null));
+
+        tree.FindHeader(Arg.Any<Hash256>(), Arg.Any<ulong?>())
+            .Returns(ci => blockHeaders[(int)ci.ArgAt<ulong?>(1)!]);
+        tree.FindBlock(Arg.Any<Hash256>(), Arg.Any<ulong?>())
+            .Returns(ci => blocks[(int)ci.ArgAt<ulong?>(1)!]);
+
+        IMasternodeVotingContract votingContract = Substitute.For<IMasternodeVotingContract>();
+        votingContract.GetCandidateOwner(Arg.Any<IWorldState>(), Arg.Any<Address>())
+            .Returns(ci => ci.ArgAt<Address>(1));
+        Address[] rewardCandidates =
+        [
+            ..masternodes,
+            protector1.Address,
+            protector2.Address,
+            observer1.Address,
+            observer2.Address,
+        ];
+        votingContract.GetCandidates(Arg.Any<BlockHeader>())
+            .Throws(new InvalidOperationException("Readonly candidates lookup should not be used for block-processing rewards."));
+        votingContract.GetCandidates(Arg.Any<ITransactionProcessor>(), Arg.Any<BlockHeader>()).Returns(rewardCandidates);
+        votingContract.GetCandidateStake(Arg.Any<BlockHeader>(), Arg.Any<Address>())
+            .Throws(new InvalidOperationException("Readonly stake lookup should not be used for block-processing rewards."));
+        votingContract.GetCandidateStake(Arg.Any<ITransactionProcessor>(), Arg.Any<BlockHeader>(), Arg.Any<Address>()).Returns(UInt256.One);
+
+        IWorldState worldState = TestWorldStateFactory.CreateForTest(TestMemDbProvider.Init(), LimboLogs.Instance);
+        using IDisposable _ = worldState.BeginScope(IWorldState.PreGenesis);
+        IMintedRecordContract mintedRecordContract = new MintedRecordContract();
+        ITransactionProcessor transactionProcessor = new XdcTransactionProcessor(
+            Substitute.For<ITransactionProcessor.IBlobBaseFeeCalculator>(),
+            specProvider,
+            worldState,
+            Substitute.For<IVirtualMachine>(),
+            Substitute.For<ICodeInfoRepository>(),
+            LimboLogs.Instance,
+            votingContract);
+        ISigningTxCache signingTxCache = new SigningTxCache(tree, specProvider);
+        XdcRewardCalculator rewardCalculator = new(
+            epochSwitchManager,
+            specProvider,
+            tree,
+            votingContract,
+            mintedRecordContract,
+            signingTxCache,
+            transactionProcessor);
+
+        BlockReward[] rewards = rewardCalculator.CalculateRewards(blocks[(int)checkpointNumber]);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(rewards, Has.Length.EqualTo(6));
+            Assert.That(rewards.Single(r => r.Address == signer1.Address).Value, Is.EqualTo((UInt256)450));
+            Assert.That(rewards.Single(r => r.Address == signer2.Address).Value, Is.EqualTo((UInt256)450));
+            Assert.That(rewards.Single(r => r.Address == protector1.Address).Value, Is.EqualTo((UInt256)360));
+            Assert.That(rewards.Single(r => r.Address == protector2.Address).Value, Is.EqualTo((UInt256)360));
+            Assert.That(rewards.Single(r => r.Address == observer1.Address).Value, Is.EqualTo((UInt256)270));
+            Assert.That(rewards.Single(r => r.Address == foundationWalletAddr).Value, Is.EqualTo((UInt256)210));
+            Assert.That(rewards.Any(r => r.Address == observer2.Address), Is.False);
+        }
+
+        // Validate minted-record accounting side effects produced by the reward upgrade path.
+        UInt256 epochNumber = 3;
+        UInt256 mintedRecordPostMintedBase = UInt256.Parse("0x0100000000000000000000000000000000000000000000000000000000000000");
+        UInt256 mintedRecordPostBurnedBase = UInt256.Parse("0x0200000000000000000000000000000000000000000000000000000000000000");
+        UInt256 mintedRecordPostRewardBlockBase = UInt256.Parse("0x0300000000000000000000000000000000000000000000000000000000000000");
+        Address mintedRecordAddress = Address.FromNumber(0x9a);
+
+        UInt256 totalMinted = ReadStorageUInt256(worldState, mintedRecordAddress, mintedRecordPostMintedBase + epochNumber);
+        UInt256 rewardBlock = ReadStorageUInt256(worldState, mintedRecordAddress, mintedRecordPostRewardBlockBase + epochNumber);
+        UInt256 onsetBlock = ReadStorageUInt256(worldState, mintedRecordAddress, (UInt256)2);
+        UInt256 totalBurned = ReadStorageUInt256(worldState, mintedRecordAddress, mintedRecordPostBurnedBase + epochNumber);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(totalMinted, Is.EqualTo((UInt256)2100));
+            Assert.That(rewardBlock, Is.EqualTo((UInt256)checkpointNumber));
+            Assert.That(onsetBlock, Is.EqualTo((UInt256)checkpointNumber));
+            Assert.That(totalBurned, Is.EqualTo(UInt256.Zero));
+        }
+    }
+
+    // Regression test: CalculateRewards must always recalculate, even when the header already
+    // carries a ProcessedRewards from a previous processing pass (e.g. a block reprocessed after
+    // a reorg). A previous version short-circuited on a non-null ProcessedRewards and returned the
+    // cached BlockRewards, which also skipped IMintedRecordContract.UpdateAccounting.
+    [Test]
+    public void CalculateRewards_CalledTwiceOnSameHeader_RecalculatesInsteadOfReturningCachedProcessedRewards()
+    {
+        const ulong epochLength = 4;
+        const ulong checkpointNumber = 2 * epochLength;
+
+        Address[] masternodes = [Address.FromNumber(1), Address.FromNumber(2)];
+        Address foundationWalletAddr = Address.FromNumber(0x68);
+        Address blockSignerContract = Address.FromNumber(0x89);
+
+        IEpochSwitchManager epochSwitchManager = Substitute.For<IEpochSwitchManager>();
+        epochSwitchManager.IsEpochSwitchAtBlock(Arg.Any<XdcBlockHeader>())
+            .Returns(ci => ((XdcBlockHeader)ci.Args()[0]!).Number % epochLength == 0);
+
+        IXdcReleaseSpec xdcSpec = Substitute.For<IXdcReleaseSpec>();
+        xdcSpec.EpochLength.Returns(epochLength);
+        xdcSpec.FoundationWallet.Returns(foundationWalletAddr);
+        xdcSpec.BlockSignerContract.Returns(blockSignerContract);
+        xdcSpec.SwitchBlock.Returns(0UL);
+        xdcSpec.MergeSignRange.Returns(1UL);
+        xdcSpec.IsTipUpgradeRewardEnabled.Returns(true);
+        xdcSpec.MaxProtectorNodes.Returns(0);
+        xdcSpec.MaxObserverNodes.Returns(0);
+        xdcSpec.MasternodeReward.Returns((UInt256)100);
+
+        ISpecProvider specProvider = Substitute.For<ISpecProvider>();
+        specProvider.GetSpec(Arg.Any<ForkActivation>()).Returns(xdcSpec);
+
+        IBlockTree tree = Substitute.For<IBlockTree>();
+        XdcBlockHeader[] blockHeaders = new XdcBlockHeader[checkpointNumber + 1];
+        for (ulong i = 0; i <= checkpointNumber; i++)
+        {
+            XdcBlockHeaderBuilder builder = Build.A.XdcBlockHeader()
+                .WithNumber(i)
+                .WithValidators(masternodes);
+            if (i == 0)
+                builder.WithExtraData(XdcTestHelper.BuildV1ExtraData(masternodes));
+            else
+                builder.WithExtraConsensusData(new ExtraFieldsV2(i, Build.A.QuorumCertificate().TestObject));
+            blockHeaders[i] = builder.TestObject;
+        }
+
+        tree.FindHeader(Arg.Any<Hash256>(), Arg.Any<ulong?>())
+            .Returns(ci => blockHeaders[(int)ci.ArgAt<ulong?>(1)!]);
+
+        IMasternodeVotingContract votingContract = Substitute.For<IMasternodeVotingContract>();
+        ISigningTxCache signingTxCache = Substitute.For<ISigningTxCache>();
+        signingTxCache.GetSigningTransactions(Arg.Any<Hash256>(), Arg.Any<ulong>(), Arg.Any<IXdcReleaseSpec>())
+            .Returns([]);
+        IMintedRecordContract mintedRecordContract = Substitute.For<IMintedRecordContract>();
+
+        XdcRewardCalculator rewardCalculator = new(
+            epochSwitchManager,
+            specProvider,
+            tree,
+            votingContract,
+            mintedRecordContract,
+            signingTxCache,
+            CreateXdcTransactionProcessor(specProvider, votingContract));
+
+        XdcBlockHeader checkpointHeader = blockHeaders[checkpointNumber];
+        Block block = new(checkpointHeader);
+
+        BlockReward[] rewardsFirstPass = rewardCalculator.CalculateRewards(block);
+
+        Assert.That(rewardsFirstPass, Is.Empty);
+        mintedRecordContract.Received(1).UpdateAccounting(
+            Arg.Any<ITransactionProcessor>(), checkpointHeader, xdcSpec, Arg.Any<UInt256>(), Arg.Any<UInt256>());
+        mintedRecordContract.ClearReceivedCalls();
+
+        // Simulate a stale cached result left over from an earlier processing pass.
+        checkpointHeader.ProcessedRewards = new XdcProcessedRewards(
+            [new BlockReward(foundationWalletAddr, (UInt256)999)],
+            XdcEpochRewards.Empty);
+
+        BlockReward[] rewardsSecondPass = rewardCalculator.CalculateRewards(block);
+
+        Assert.That(rewardsSecondPass, Is.Empty, "the stale cached reward must not be returned - CalculateRewards must always recalculate");
+        mintedRecordContract.Received(1).UpdateAccounting(
+            Arg.Any<ITransactionProcessor>(), checkpointHeader, xdcSpec, Arg.Any<UInt256>(), Arg.Any<UInt256>());
+    }
+
+    [Test]
+    public void RewardCalculator_CalculateRewardsForSignersAndHolders_MatchesExpectedValues()
+    {
+        IMasternodeVotingContract masternodeVotingContract = Substitute.For<IMasternodeVotingContract>();
+        IBlockTree blockTree = Substitute.For<IBlockTree>();
+        ISpecProvider specProvider = Substitute.For<ISpecProvider>();
+        ISigningTxCache signingTxCache = new SigningTxCache(blockTree, specProvider);
+        XdcRewardCalculator rewardCalculator = new(
+            Substitute.For<IEpochSwitchManager>(),
+            specProvider,
+            blockTree,
+            masternodeVotingContract,
+            Substitute.For<IMintedRecordContract>(),
+            signingTxCache,
+            CreateXdcTransactionProcessor(specProvider, masternodeVotingContract));
+
+        UInt256 totalReward = UInt256.Parse("171000000000000000000");
+        ulong totalSigner = 177, sign = 59;
+        UInt256 expectedReward = UInt256.Parse("56999999999999999983");
+
+        Assert.That(rewardCalculator.CalculateProportionalReward(sign, totalSigner, totalReward), Is.EqualTo(expectedReward));
+
+        UInt256 expectedAmountOwner = UInt256.Parse(("51299999999999999984"));
+        UInt256 expectedAmountFoundationWallet = UInt256.Parse(("5699999999999999998"));
+        bool ok = Address.TryParse("0x68d1e2F85e4583BeCc610b47Dd1b857850a4025A", out Address? signer);
+        Assert.That(ok, Is.True);
+        Address foundationWalletAddr = Address.FromNumber(0x68);
+        masternodeVotingContract.GetCandidateOwner(Arg.Any<IWorldState>(), signer!).Returns(signer!);
+        (BlockReward holderReward, UInt256 foundationWalletReward) = rewardCalculator.DistributeRewards(signer!, expectedReward, foundationWalletAddr);
+
+        using (Assert.EnterMultipleScope())
+        {
+            Assert.That(holderReward.Value, Is.EqualTo(expectedAmountOwner));
+            Assert.That(foundationWalletReward, Is.EqualTo(expectedAmountFoundationWallet));
+        }
+    }
+
+    [Test]
+    public void DistributeRewards_OwnerIsFoundation_MatchesReferenceOverwriteBehavior()
+    {
+        IMasternodeVotingContract masternodeVotingContract = Substitute.For<IMasternodeVotingContract>();
+        IBlockTree blockTree = Substitute.For<IBlockTree>();
+        ISpecProvider specProvider = Substitute.For<ISpecProvider>();
+        ISigningTxCache signingTxCache = new SigningTxCache(blockTree, specProvider);
+        XdcRewardCalculator rewardCalculator = new(
+            Substitute.For<IEpochSwitchManager>(),
+            specProvider,
+            blockTree,
+            masternodeVotingContract,
+            Substitute.For<IMintedRecordContract>(),
+            signingTxCache,
+            CreateXdcTransactionProcessor(specProvider, masternodeVotingContract));
+
+        Address signer = new("0x80b329b66ddfe2180904d6ae737283a3f1860b83");
+        Address foundationWalletAddr = new("0x5cb041be27deb4a506ad63d082c6043b4a5c6898");
+        UInt256 reward = UInt256.Parse("666666666666666633");
+        UInt256 expectedFoundationReward = UInt256.Parse("66666666666666663");
+        masternodeVotingContract.GetCandidateOwner(Arg.Any<IWorldState>(), signer).Returns(foundationWalletAddr);
+
+        (BlockReward holderReward, UInt256 foundationWalletReward) = rewardCalculator.DistributeRewards(signer, reward, foundationWalletAddr);
+
+        Assert.That(holderReward.Address, Is.EqualTo(foundationWalletAddr));
+        Assert.That(holderReward.Value, Is.EqualTo(expectedFoundationReward));
+        Assert.That(foundationWalletReward, Is.EqualTo(UInt256.Zero));
+    }
+
+    private static Transaction BuildSigningTx(IXdcReleaseSpec spec, ulong blockNumber, Hash256 blockHash, PrivateKey signer, ulong nonce = 0)
+    {
+        // These are protocol constants (not "test magic numbers"):
+        const int signingTxGasLimit = 200_000;
+        const int chainId = 0;
+
         return Build.A.Transaction
-            .WithChainId(0)
-            .WithNonce((UInt256)nonce)
-            .WithGasLimit(200000)
+            .WithChainId(chainId)
+            .WithNonce(nonce)
+            .WithGasLimit(signingTxGasLimit)
             .WithXdcSigningData(blockNumber, blockHash)
             .ToBlockSignerContract(spec)
             .SignedAndResolved(signer)
             .TestObject;
     }
 
-    private static PrivateKey GetSignerFromMasternodes(XdcTestBlockchain chain, XdcBlockHeader header, IXdcReleaseSpec spec)
+    private static XdcRewardCalculatorSource CreateRewardCalculatorSource(bool isSubnet)
     {
-        EpochSwitchInfo? epochInfo = chain.EpochSwitchManager.GetEpochSwitchInfo(header);
-        Assert.That(epochInfo, Is.Not.Null);
-        return chain.TakeRandomMasterNodes(spec, epochInfo).First();
+        IEpochSwitchManager epochSwitchManager = Substitute.For<IEpochSwitchManager>();
+        ISpecProvider specProvider = Substitute.For<ISpecProvider>();
+        IBlockTree blockTree = Substitute.For<IBlockTree>();
+        IMasternodeVotingContract masternodeVotingContract = Substitute.For<IMasternodeVotingContract>();
+        IMintedRecordContract mintedRecordContract = Substitute.For<IMintedRecordContract>();
+        ISigningTxCache signingTxCache = Substitute.For<ISigningTxCache>();
+        return isSubnet
+            ? new XdcSubnetRewardCalculatorSource(epochSwitchManager, specProvider, blockTree, masternodeVotingContract, mintedRecordContract, signingTxCache)
+            : new XdcRewardCalculatorSource(epochSwitchManager, specProvider, blockTree, masternodeVotingContract, mintedRecordContract, signingTxCache);
+    }
+
+    private static XdcTransactionProcessor CreateXdcTransactionProcessor(
+        ISpecProvider specProvider,
+        IMasternodeVotingContract masternodeVotingContract,
+        IWorldState? worldState = null) => new(
+            Substitute.For<ITransactionProcessor.IBlobBaseFeeCalculator>(),
+            specProvider,
+            worldState ?? Substitute.For<IWorldState>(),
+            Substitute.For<IVirtualMachine>(),
+            Substitute.For<ICodeInfoRepository>(),
+            LimboLogs.Instance,
+            masternodeVotingContract);
+
+    private static UInt256 ReadStorageUInt256(IWorldState worldState, Address address, UInt256 slot)
+    {
+        ReadOnlySpan<byte> value = worldState.Get(new StorageCell(address, slot));
+        return value.Length == 0 ? UInt256.Zero : new UInt256(value, isBigEndian: true);
     }
 }

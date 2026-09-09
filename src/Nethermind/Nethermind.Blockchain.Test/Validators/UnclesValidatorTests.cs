@@ -12,6 +12,8 @@ using NUnit.Framework;
 
 namespace Nethermind.Blockchain.Test.Validators;
 
+[Parallelizable(ParallelScope.All)]
+[FixtureLifeCycle(LifeCycle.InstancePerTestCase)]
 public class UnclesValidatorTests
 {
     private Block _greatGrandparent;
@@ -110,7 +112,7 @@ public class UnclesValidatorTests
         foreach (BlockHeader uncle in uncles)
         {
             _headerValidator.Validate(uncle,
-                    _blockTree.FindParentHeader(uncle, BlockTreeLookupOptions.TotalDifficultyNotNeeded), true)
+                    _blockTree.FindParentHeader(uncle, BlockTreeLookupOptions.TotalDifficultyNotNeeded)!, true)
                 .Returns(true);
         }
     }
@@ -120,7 +122,7 @@ public class UnclesValidatorTests
         foreach (BlockHeader uncle in uncles)
         {
             _headerValidator.Received(1).Validate(uncle,
-                _blockTree.FindParentHeader(uncle, BlockTreeLookupOptions.TotalDifficultyNotNeeded), true);
+                _blockTree.FindParentHeader(uncle, BlockTreeLookupOptions.TotalDifficultyNotNeeded)!, true);
         }
 
         Assert.That(_headerValidator.ReceivedCalls().Count, Is.EqualTo(uncles.Length)); // No other calls happened

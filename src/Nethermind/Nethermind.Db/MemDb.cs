@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: LGPL-3.0-only
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -11,31 +10,25 @@ using Nethermind.Core.Extensions;
 
 namespace Nethermind.Db
 {
-    public class MemDb : IFullDb
+    public partial class MemDb : IFullDb, IRangeRemovableKeyValueStore
     {
         private readonly int _writeDelay; // for testing scenarios
         private readonly int _readDelay; // for testing scenarios
         public long ReadsCount { get; private set; }
         public long WritesCount { get; private set; }
 
-#if ZK
-        private readonly Dictionary<byte[], byte[]?> _db;
-        private readonly Dictionary<byte[], byte[]?>.AlternateLookup<ReadOnlySpan<byte>> _spanDb;
-#else
-        private readonly ConcurrentDictionary<byte[], byte[]?> _db;
-        private readonly ConcurrentDictionary<byte[], byte[]?>.AlternateLookup<ReadOnlySpan<byte>> _spanDb;
-#endif
-
-
         public MemDb(string name)
-            : this(0, 0)
-        {
-            Name = name;
-        }
+            : this(0, 0) => Name = name;
+
+        /// <summary>Creates a database presized for a known number of entries.</summary>
+        /// <remarks>A factory rather than a constructor so it cannot be confused with the
+        /// <c>(writeDelay, readDelay)</c> overload.</remarks>
+        /// <param name="capacity">The expected number of entries; presizing avoids rehashing during bulk loads.</param>
+        public static MemDb WithCapacity(int capacity) => new(0, 0, capacity);
 
         public static MemDb CopyFrom(IDb anotherDb)
         {
-            MemDb newDb = new MemDb();
+            MemDb newDb = new();
             foreach (KeyValuePair<byte[], byte[]> kv in anotherDb.GetAll())
             {
                 newDb[kv.Key] = kv.Value;
@@ -49,29 +42,16 @@ namespace Nethermind.Db
         }
 
         public MemDb(int writeDelay, int readDelay)
+            : this(writeDelay, readDelay, capacity: 0)
         {
-            _writeDelay = writeDelay;
-            _readDelay = readDelay;
-#if ZK
-            _db = new Dictionary<byte[], byte[]>(Bytes.EqualityComparer);
-#else
-            _db = new ConcurrentDictionary<byte[], byte[]>(Bytes.EqualityComparer);
-#endif
-            _spanDb = _db.GetAlternateLookup<ReadOnlySpan<byte>>();
         }
 
         public string Name { get; } = nameof(MemDb);
 
         public virtual byte[]? this[ReadOnlySpan<byte> key]
         {
-            get
-            {
-                return Get(key);
-            }
-            set
-            {
-                Set(key, value);
-            }
+            get => Get(key);
+            set => Set(key, value);
         }
 
         public KeyValuePair<byte[], byte[]?>[] this[byte[][] keys]
@@ -84,17 +64,8 @@ namespace Nethermind.Db
                 }
 
                 ReadsCount += keys.Length;
-                return keys.Select(k => new KeyValuePair<byte[], byte[]>(k, _db.TryGetValue(k, out var value) ? value : null)).ToArray();
+                return keys.Select(k => new KeyValuePair<byte[], byte[]?>(k, _db.GetValueOrDefault(k))).ToArray();
             }
-        }
-
-        public virtual void Remove(ReadOnlySpan<byte> key)
-        {
-#if ZK
-            _spanDb.Remove(key);
-#else
-            _spanDb.TryRemove(key, out _);
-#endif
         }
 
         public bool KeyExists(ReadOnlySpan<byte> key) => _spanDb.ContainsKey(key);
@@ -103,7 +74,22 @@ namespace Nethermind.Db
 
         public void Clear() => _db.Clear();
 
-        public IEnumerable<KeyValuePair<byte[], byte[]?>> GetAll(bool ordered = false) => ordered ? OrderedDb : _db;
+        /// <summary>Half-open, matching the RocksDB range tombstone this stands in for in tests.</summary>
+        public void RemoveRange(ReadOnlySpan<byte> firstKeyInclusive, ReadOnlySpan<byte> lastKeyExclusive)
+        {
+            foreach (byte[] key in Keys)
+            {
+                if (Bytes.BytesComparer.Compare(key, firstKeyInclusive) >= 0 && Bytes.BytesComparer.Compare(key, lastKeyExclusive) < 0)
+                {
+                    Remove(key);
+                }
+            }
+        }
+
+        // Removing already returned the memory; there is no deferred storage to give back.
+        public void ReclaimRange(ReadOnlySpan<byte> firstKeyInclusive, ReadOnlySpan<byte> lastKeyExclusive) { }
+
+        public IEnumerable<KeyValuePair<byte[], byte[]>> GetAll(bool ordered = false) => ordered ? OrderedDb : _db;
 
         public IEnumerable<byte[]> GetAllKeys(bool ordered = false) => ordered ? OrderedDb.Select(kvp => kvp.Key) : Keys;
 
@@ -111,8 +97,8 @@ namespace Nethermind.Db
 
         public virtual IWriteBatch StartWriteBatch() => this.LikeABatch();
 
-        public ICollection<byte[]> Keys => _db.Keys;
-        public ICollection<byte[]> Values => _db.Values;
+        public ICollection<byte[]> Keys => _db.Select(static kvp => kvp.Key).ToArray();
+        public ICollection<byte[]> Values => _db.Select(static kvp => kvp.Value).ToArray();
 
         public int Count => _db.Count;
 
@@ -120,9 +106,7 @@ namespace Nethermind.Db
 
         public bool PreferWriteByArray => true;
 
-        public virtual Span<byte> GetSpan(ReadOnlySpan<byte> key) => Get(key).AsSpan();
-
-        public void DangerousReleaseMemory(in ReadOnlySpan<byte> span) { }
+        public unsafe void DangerousReleaseMemory(in ReadOnlySpan<byte> span) { }
 
         public virtual byte[]? Get(ReadOnlySpan<byte> key, ReadFlags flags = ReadFlags.None)
         {
@@ -132,8 +116,11 @@ namespace Nethermind.Db
             }
 
             ReadsCount++;
-            return _spanDb.TryGetValue(key, out byte[] value) ? value : null;
+            return _spanDb.TryGetValue(key, out byte[]? value) ? value : null;
         }
+
+        public unsafe Span<byte> GetSpan(scoped ReadOnlySpan<byte> key, ReadFlags flags = ReadFlags.None)
+            => Get(key).AsSpan();
 
         public virtual void Set(ReadOnlySpan<byte> key, byte[]? value, WriteFlags flags = WriteFlags.None)
         {
@@ -151,8 +138,10 @@ namespace Nethermind.Db
             _spanDb[key] = value;
         }
 
-        public IDbMeta.DbMetric GatherMetric(bool includeSharedCache = false) => new() { Size = Count };
+        public virtual IDbMeta.DbMetric GatherMetric() => new() { Size = Count };
 
-        private IEnumerable<KeyValuePair<byte[], byte[]?>> OrderedDb => _db.OrderBy(kvp => kvp.Key, Bytes.Comparer);
+        public long EstimatedCount => Count;
+
+        private IEnumerable<KeyValuePair<byte[], byte[]>> OrderedDb => _db.OrderBy(kvp => kvp.Key, Bytes.Comparer);
     }
 }

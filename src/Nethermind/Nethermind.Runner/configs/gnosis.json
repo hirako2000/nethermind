@@ -14,8 +14,8 @@
   "Sync": {
     "FastSync": true,
     "SnapSync": true,
-    "PivotNumber": 43970000,
-    "PivotHash": "0xdd75a603dd94638a2cd3bc5e8625e2e1b9e4fa976c698d8e011c8ae59db495ab",
+    "PivotNumber": 48090000,
+    "PivotHash": "0xbc5ca57b4dbd08a7ff9abe0059a3f41ffcf02ae6eba5f5d243592ffef4b0a259",
     "PivotTotalDifficulty": "8626000110427538733349499292577475819600160930",
     "UseGethLimitsInFastBlocks": false,
     "FastSyncCatchUpHeightDelta": 10000000000,
@@ -45,11 +45,7 @@
   "Metrics": {
     "NodeName": "Gnosis"
   },
-  "Bloom": {
-    "IndexLevelBucketSizes": [
-      16,
-      16,
-      16
-    ]
+  "Db": {
+    "SkipCheckingSstFileSizesOnDbOpen": true
   }
 }

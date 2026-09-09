@@ -40,6 +40,8 @@ public class BlockHeaderForRpc
         ExcessBlobGas = header.ExcessBlobGas;
         ParentBeaconBlockRoot = header.ParentBeaconBlockRoot;
         RequestsHash = header.RequestsHash;
+        SlotNumber = header.SlotNumber;
+        BlockAccessListHash = header.BlockAccessListHash;
     }
 
     [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
@@ -56,10 +58,10 @@ public class BlockHeaderForRpc
     public UInt256 Difficulty { get; set; }
 
     [JsonIgnore(Condition = JsonIgnoreCondition.Never)]
-    public long Number { get; set; }
+    public ulong Number { get; set; }
 
-    public long GasLimit { get; set; }
-    public long GasUsed { get; set; }
+    public ulong GasLimit { get; set; }
+    public ulong GasUsed { get; set; }
     public UInt256 Timestamp { get; set; }
     public byte[] ExtraData { get; set; } = [];
     public Hash256? MixHash { get; set; }
@@ -82,4 +84,8 @@ public class BlockHeaderForRpc
 
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Hash256? RequestsHash { get; set; }
+
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ulong? SlotNumber { get; set; }
+    public Hash256? BlockAccessListHash { get; set; }
 }

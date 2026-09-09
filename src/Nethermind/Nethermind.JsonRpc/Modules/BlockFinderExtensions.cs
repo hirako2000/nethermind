@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: LGPL-3.0-only
 
 using System.Collections.Generic;
-using Nethermind.Blockchain;
 using Nethermind.Blockchain.Find;
 using Nethermind.Core;
 using Nethermind.Core.Crypto;
@@ -11,10 +10,11 @@ namespace Nethermind.JsonRpc.Modules
 {
     public static class BlockFinderExtensions
     {
+        public const string HeaderNotFound = "header not found";
 
         public static bool IsBlockPruned(this IBlockFinder blockFinder, BlockParameter blockParameter)
         {
-            var requestedBlock = blockParameter.BlockNumber;
+            ulong? requestedBlock = blockParameter.BlockNumber;
             if (requestedBlock is null)
             {
                 SearchResult<BlockHeader> headerResult = blockFinder.SearchForHeader(blockParameter);
@@ -23,7 +23,9 @@ namespace Nethermind.JsonRpc.Modules
                     requestedBlock = headerResult.Object.Number;
                 }
             }
-            return requestedBlock < blockFinder.GetLowestBlock();
+            // The served floor, not the published boundary: during a backfill the two differ, and this check
+            // must agree with what the node advertises as earliest over eth/69.
+            return requestedBlock < blockFinder.LowestServedBlock;
         }
 
         public static SearchResult<BlockHeader> SearchForHeader(this IBlockFinder blockFinder, BlockParameter? blockParameter, bool allowNulls = false)
@@ -46,7 +48,7 @@ namespace Nethermind.JsonRpc.Modules
             }
 
             return header is null && !allowNulls
-                ? new SearchResult<BlockHeader>($"{blockParameter.BlockHash?.ToString() ?? blockParameter.BlockNumber?.ToString() ?? blockParameter.Type.ToString()} could not be found", ErrorCodes.ResourceNotFound)
+                ? new SearchResult<BlockHeader>(HeaderNotFound, ErrorCodes.ResourceNotFound)
                 : new SearchResult<BlockHeader>(header);
         }
 
@@ -73,14 +75,14 @@ namespace Nethermind.JsonRpc.Modules
 
                 if (blockFinder.IsBlockPruned(blockParameter))
                 {
-                    return new SearchResult<Block>("Pruned history unavailable", ErrorCodes.PrunedHistoryUnavailable);
+                    return new SearchResult<Block>(
+                        $"{ErrorMessages.PrunedHistoryUnavailable} for block {blockParameter}",
+                        ErrorCodes.PrunedHistoryUnavailable);
                 }
 
                 if (!allowNulls)
                 {
-                    return new SearchResult<Block>(
-                        $"Block {blockParameter.BlockHash?.ToString() ?? blockParameter.BlockNumber?.ToString() ?? blockParameter.Type.ToString()} could not be found",
-                        ErrorCodes.ResourceNotFound);
+                    return new SearchResult<Block>(HeaderNotFound, ErrorCodes.ResourceNotFound);
                 }
             }
 
@@ -109,14 +111,14 @@ namespace Nethermind.JsonRpc.Modules
                 else
                 {
                     yield return startingBlock;
-                    long startingBlockNumber = startingBlock.Object.Number;
-                    long finalBlockNumber = finalBlockHeader.Object.Number;
+                    ulong startingBlockNumber = startingBlock.Object.Number;
+                    ulong finalBlockNumber = finalBlockHeader.Object.Number;
                     if (startingBlockNumber > finalBlockNumber)
                     {
                         yield return new SearchResult<Block>($"From block number: {startingBlockNumber} is greater than to block number {finalBlockNumber}", ErrorCodes.InvalidInput);
                     }
 
-                    for (long i = startingBlock.Object.Number + 1; i <= finalBlockHeader.Object.Number; ++i)
+                    for (ulong i = startingBlock.Object.Number + 1; i <= finalBlockHeader.Object.Number; ++i)
                     {
                         yield return SearchForBlock(blockFinder, new BlockParameter(i));
                     }

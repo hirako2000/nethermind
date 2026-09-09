@@ -7,6 +7,13 @@ on:
     branches: [master]
   merge_group:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build
@@ -21,6 +28,7 @@ jobs:
         with:
           large-packages: false
           tool-cache: false
+          swap-storage: false
 
       - name: Check out repository
         uses: actions/checkout@v6
@@ -29,9 +37,6 @@ jobs:
 
       - name: Set up .NET
         uses: actions/setup-dotnet@v5
-        with:
-          cache: true
-          cache-dependency-path: src/Nethermind/Nethermind.Runner/packages.lock.json
 
       - name: Install dependencies
         run: dotnet restore src/Nethermind/${{ matrix.solution }}.slnx --locked-mode

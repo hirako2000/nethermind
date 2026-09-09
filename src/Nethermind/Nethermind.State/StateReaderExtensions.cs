@@ -6,7 +6,6 @@ using System.Threading;
 using Nethermind.Core;
 using Nethermind.Core.Crypto;
 using Nethermind.Core.Extensions;
-using Nethermind.Evm.State;
 using Nethermind.Int256;
 using Nethermind.Logging;
 using Nethermind.Trie;
@@ -15,7 +14,7 @@ namespace Nethermind.State
 {
     public static class StateReaderExtensions
     {
-        public static UInt256 GetNonce(this IStateReader stateReader, BlockHeader? baseBlock, Address address)
+        public static ulong GetNonce(this IStateReader stateReader, BlockHeader? baseBlock, Address address)
         {
             stateReader.TryGetAccount(baseBlock, address, out AccountStruct account);
             return account.Nonce;
@@ -33,10 +32,7 @@ namespace Nethermind.State
             return account.StorageRoot;
         }
 
-        public static byte[] GetCode(this IStateReader stateReader, BlockHeader? baseBlock, Address address)
-        {
-            return stateReader.GetCode(GetCodeHash(stateReader, baseBlock, address)) ?? [];
-        }
+        public static byte[] GetCode(this IStateReader stateReader, BlockHeader? baseBlock, Address address) => stateReader.GetCode(GetCodeHash(stateReader, baseBlock, address)) ?? [];
 
         public static ValueHash256 GetCodeHash(this IStateReader stateReader, BlockHeader? baseBlock, Address address)
         {
@@ -50,8 +46,9 @@ namespace Nethermind.State
             stateProvider.RunTreeVisitor(collector, baseBlock, new VisitingOptions
             {
                 MaxDegreeOfParallelism = Environment.ProcessorCount,
-                FullScanMemoryBudget = 16.GiB(), // Gonna guess that if you are running this, you have a decent setup.
+                FullScanMemoryBudget = 16.GiB, // Gonna guess that if you are running this, you have a decent setup.
             });
+            collector.Finish();
             return collector.Stats;
         }
 
